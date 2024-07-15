@@ -1,5 +1,6 @@
 from   copy import deepcopy
 import math
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -207,43 +208,49 @@ class CspDarknet(nn.Module):
         return p8, p16, p32
     
 
-def bbox_iou(box1, box2, GIoU=False, DIoU=False, CIoU=False, eps=1e-7):
+def bbox_iou(box1, box2, iou_type, eps=1e-7):
     b1_x1, b1_y1, b1_x2, b1_y2 = box1.chunk(4, -1)
     b2_x1, b2_y1, b2_x2, b2_y2 = map(lambda t: t.transpose(-2,-1), box2.chunk(4, -1))
-    w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps
-    w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps
+    w1, h1  = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps
+    w2, h2  = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps
 
-    # Intersection area
-    inter = (b1_x2.minimum(b2_x2) - b1_x1.maximum(b2_x1)).clamp_(0) * (b1_y2.minimum(b2_y2) - b1_y1.maximum(b2_y1)).clamp_(0)
+    inter   = (b1_x2.minimum(b2_x2) - b1_x1.maximum(b2_x1)).clamp_(0) * (b1_y2.minimum(b2_y2) - b1_y1.maximum(b2_y1)).clamp_(0)
+    union   = w1*h1 + w2*h2 - inter
+    iou     = inter / (union + eps)
 
-    # Union Area
-    union = w1 * h1 + w2 * h2 - inter + eps
+    if iou_type == "IoU":
+        return iou
+    
+    cw      = b1_x2.maximum(b2_x2) - b1_x1.minimum(b2_x1)  # convex (smallest enclosing box) width
+    ch      = b1_y2.maximum(b2_y2) - b1_y1.minimum(b2_y1)  # convex height
+    c_area  = cw*ch  # convex area 
 
-    # IoU
-    iou = inter / union
-    if CIoU or DIoU or GIoU:
-        cw = b1_x2.maximum(b2_x2) - b1_x1.minimum(b2_x1)  # convex (smallest enclosing box) width
-        ch = b1_y2.maximum(b2_y2) - b1_y1.minimum(b2_y1)  # convex height
-        if CIoU or DIoU:  # Distance or Complete IoU https://arxiv.org/abs/1911.08287v1
-            c2 = cw.pow(2) + ch.pow(2) + eps  # convex diagonal squared
-            rho2 = (
-                (b2_x1 + b2_x2 - b1_x1 - b1_x2).pow(2) + (b2_y1 + b2_y2 - b1_y1 - b1_y2).pow(2)
-            ) / 4  # center dist**2
-            if CIoU:  # https://github.com/Zzh-tju/DIoU-SSD-pytorch/blob/master/utils/box/box_utils.py#L47
-                v = (4 / math.pi**2) * ((w2 / h2).atan() - (w1 / h1).atan()).pow(2)
-                with torch.no_grad():
-                    alpha = v / (v - iou + (1 + eps))
-                return iou - (rho2 / c2 + v * alpha)  # CIoU
-            return iou - rho2 / c2  # DIoU
-        c_area = cw * ch + eps  # convex area
-        return iou - (c_area - union) / c_area  # GIoU https://arxiv.org/pdf/1902.09630.pdf
-    return iou  # IoU
+    if iou_type == "GIoU":
+        return iou - (c_area - union) / (c_area + eps)
+    
+    c2      = cw.pow(2) + ch.pow(2)  # convex diagonal squared
+    rho2    = ((b2_x1 + b2_x2 - b1_x1 - b1_x2).pow(2) + (b2_y1 + b2_y2 - b1_y1 - b1_y2).pow(2)) / 4  # center dist**2
+    diou    = iou - rho2 / (c2 + eps)
+
+    if iou_type == "DIoU":
+        return diou
+
+    v = (4 / math.pi**2) * ((w2 / h2).atan() - (w1 / h1).atan()).pow(2)
+    with torch.no_grad():
+        alpha = v / (v - iou + (1 + eps))
+    
+    if iou_type == "CIoU":
+        return diou - alpha * v
+
+    assert False, f"Unsupported IOU type {iou_type}"
 
 
 class DeTr(nn.Module):
     def __init__(self, num_classes, max_dets=100):
         super().__init__()
         dim             = 512
+        self.nc         = num_classes
+        self.nd         = max_dets
         self.enc        = CspDarknet()
         self.proj       = nn.Linear(1024, dim)
         self.dec        = Transformer([TransformerDecoderLayer(dim=dim, heads=4, ff_mult=2.0, dropout=0.) for _ in range(4)])
@@ -252,13 +259,34 @@ class DeTr(nn.Module):
         self.proj_cls   = nn.Linear(dim, num_classes)
 
     def forward(self, x, targets=None):
-        x   = self.enc(x)[-1]
-        x   = self.proj(rearrange(x, 'b f h w -> b (h w) f'))
-        q   = self.dec(repeat(self.q, 'd f -> b d f', b=x.shape[0]), x)
-        box = self.proj_bbox(q).relu_()
-        cls = self.proj_cls(x)
+        x       = self.enc(x)[-1]
+        x       = self.proj(rearrange(x, 'b f h w -> b (h w) f'))
+        q       = self.dec(repeat(self.q, 'd f -> b d f', b=x.shape[0]), x)
+        box     = self.proj_bbox(q).relu_()
+        cls     = self.proj_cls(q)
+        preds   = torch.cat((box, cls.sigmoid()), -1) 
 
         if exists(targets):
-            B, D = targets.shape[0], targets.shape[1]
-            ious = bbox_iou(targets[...,:4], box, CIoU=True)
-        return torch.cat((box, cls.sigmoid()), 2)    
+            B, N        = box.shape[0], self.nd
+            tbox, tcls  = targets[...,:4], targets[...,4].long()
+            tmask       = tcls >= 0
+            ious        = bbox_iou(tbox, box, iou_type="CIoU") # [B, D, N]
+
+            # Hungarian matcher
+            with torch.no_grad():
+                idx  = torch.tensor(np.array([linear_sum_assignment(ious_i.detach().cpu(), maximize=True)[1] for ious_i in ious]))
+            pmask = torch.zeros((B,N), dtype=torch.bool, device=x.device)
+            pmask.scatter_(1, idx, tmask)
+
+            # Losses
+            ious        = ious.gather(2, idx.unsqueeze(-1)).squeeze(-1)
+            ious        = ious[tmask]
+            loss_iou    = (1-ious).mean()
+
+            cls_obj     = cls[pmask]
+            cls_noobj   = cls[~pmask]
+            tcls        = F.one_hot(tcls[tmask], num_classes=self.nc).float()
+            loss_cls    = F.binary_cross_entropy_with_logits(cls_obj, tcls) + \
+                          F.binary_cross_entropy_with_logits(cls_noobj, torch.ones_like(cls_noobj))
+
+        return preds if not exists(targets) else (preds, loss_iou, loss_cls)
